@@ -55,12 +55,13 @@ CREATE TABLE IF NOT EXISTS users (
     surname     VARCHAR(255)
 );
 
--- Таблица дневника (5 вопросов за день)
+-- Таблица дневника (5 вопросов за день + Readiness Score)
 CREATE TABLE IF NOT EXISTS diary (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    date        DATE NOT NULL,
-    data        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date            DATE NOT NULL,
+    data            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    readiness_score NUMERIC(4,1),
     UNIQUE(user_id, date)
 );
 
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS events (
     time        TIME NOT NULL,
     name        VARCHAR(255) NOT NULL,
     description TEXT,
-    priority    INTEGER DEFAULT 5
+    priority    INTEGER DEFAULT 5,
+    event_type  VARCHAR(50) DEFAULT 'routine'
 );
 
 -- Таблица прогнозов DeepSeek
@@ -85,9 +87,35 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 """
 
+# ── SQL: миграции (добавление колонок, если таблицы уже существуют) ──
+MIGRATION_SQL = """
+-- Добавляем event_type в events, если колонки нет
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'events' AND column_name = 'event_type'
+    ) THEN
+        ALTER TABLE events ADD COLUMN event_type VARCHAR(50) DEFAULT 'routine';
+    END IF;
+END $$;
+
+-- Добавляем readiness_score в diary, если колонки нет
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'diary' AND column_name = 'readiness_score'
+    ) THEN
+        ALTER TABLE diary ADD COLUMN readiness_score NUMERIC(4,1);
+    END IF;
+END $$;
+"""
+
 
 async def init_db(pool: asyncpg.Pool) -> None:
-    """Выполняет SQL инициализации таблиц (если их нет)."""
+    """Выполняет SQL инициализации таблиц и миграций."""
     async with pool.acquire() as conn:
         await conn.execute(INIT_SQL)
-    logger.info("Таблицы БД проверены / созданы")
+        await conn.execute(MIGRATION_SQL)
+    logger.info("Таблицы БД проверены / созданы, миграции применены")

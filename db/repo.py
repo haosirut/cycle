@@ -5,7 +5,7 @@ CRUD-операции (Repository) для работы с таблицами Б�
 
 import asyncpg
 import json
-from datetime import date, time as dtime
+from datetime import date, time as dtime, timedelta
 from typing import Optional
 
 
@@ -67,26 +67,32 @@ class Repo:
                 entry_date,
             )
 
-    async def create_diary_entry(self, user_id: int, entry_date: date, data: dict) -> asyncpg.Record:
-        """Создаёт новую запись дневника."""
+    async def create_diary_entry(
+        self, user_id: int, entry_date: date, data: dict, readiness_score: float = None
+    ) -> asyncpg.Record:
+        """Создаёт новую запись дневника с опциональным Readiness Score."""
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                INSERT INTO diary (user_id, date, data)
-                VALUES ($1, $2, $3::jsonb)
+                INSERT INTO diary (user_id, date, data, readiness_score)
+                VALUES ($1, $2, $3::jsonb, $4)
                 RETURNING *
                 """,
                 user_id,
                 entry_date,
                 json.dumps(data),
+                readiness_score,
             )
 
-    async def update_diary_entry(self, user_id: int, entry_date: date, data: dict) -> None:
-        """Полностью обновляет JSON-данные записи дневника."""
+    async def update_diary_entry(
+        self, user_id: int, entry_date: date, data: dict, readiness_score: float = None
+    ) -> None:
+        """Обновляет JSON-данные и Readiness Score записи дневника."""
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "UPDATE diary SET data = $1::jsonb WHERE user_id = $2 AND date = $3",
+                "UPDATE diary SET data = $1::jsonb, readiness_score = $2 WHERE user_id = $3 AND date = $4",
                 json.dumps(data),
+                readiness_score,
                 user_id,
                 entry_date,
             )
@@ -100,6 +106,22 @@ class Repo:
                 entry_date,
             )
 
+    async def get_recent_diary(self, user_id: int, days: int = 7) -> list[asyncpg.Record]:
+        """
+        Возвращает записи дневника за последние N дней.
+        Используется для анализа трендов и вычисления Readiness Score.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT date, data, readiness_score FROM diary
+                WHERE user_id = $1 AND date >= CURRENT_DATE - $2::integer
+                ORDER BY date ASC
+                """,
+                user_id,
+                days,
+            )
+
     # ── События ──────────────────────────────────────────────
 
     async def create_event(
@@ -110,13 +132,14 @@ class Repo:
         name: str,
         description: str,
         priority: int,
+        event_type: str = "routine",
     ) -> asyncpg.Record:
-        """Создаёт новое событие."""
+        """Создаёт новое событие с типом."""
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                INSERT INTO events (user_id, event_date, time, name, description, priority)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO events (user_id, event_date, time, name, description, priority, event_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
                 """,
                 user_id,
@@ -125,6 +148,7 @@ class Repo:
                 name,
                 description,
                 priority,
+                event_type,
             )
 
     async def get_events_by_date(self, user_id: int, event_date: date) -> list[asyncpg.Record]:
@@ -153,7 +177,7 @@ class Repo:
         Внимание: field передаётся как имя колонки — используется только
         из доверенного кода (не от пользователя напрямую).
         """
-        allowed_fields = {"event_date", "time", "name", "description", "priority"}
+        allowed_fields = {"event_date", "time", "name", "description", "priority", "event_type"}
         if field not in allowed_fields:
             raise ValueError(f"Запрещённое поле для обновления: {field}")
         async with self.pool.acquire() as conn:
@@ -217,7 +241,7 @@ class Repo:
         async with self.pool.acquire() as conn:
             diary_rows = await conn.fetch(
                 """
-                SELECT date, data FROM diary
+                SELECT date, data, readiness_score FROM diary
                 WHERE user_id = $1
                 ORDER BY date ASC
                 """,
@@ -225,7 +249,7 @@ class Repo:
             )
             events_rows = await conn.fetch(
                 """
-                SELECT event_date, time, name, description, priority FROM events
+                SELECT event_date, time, name, description, priority, event_type FROM events
                 WHERE user_id = $1 AND event_date >= CURRENT_DATE
                 ORDER BY event_date ASC, time ASC
                 """,
@@ -233,7 +257,12 @@ class Repo:
             )
 
         diary_list = [
-            {"date": str(r["date"]), "data": r["data"]} for r in diary_rows
+            {
+                "date": str(r["date"]),
+                "data": r["data"],
+                "readiness_score": float(r["readiness_score"]) if r["readiness_score"] else None,
+            }
+            for r in diary_rows
         ]
         events_list = [
             {
@@ -242,6 +271,7 @@ class Repo:
                 "name": r["name"],
                 "description": r["description"],
                 "priority": r["priority"],
+                "event_type": r["event_type"],
             }
             for r in events_rows
         ]

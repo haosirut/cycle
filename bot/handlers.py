@@ -22,6 +22,8 @@ from bot.keyboards import (
     planner_action_kb,
     events_list_kb,
     event_edit_field_kb,
+    event_type_kb,
+    EVENT_TYPES,
     confirm_kb,
     cycles_menu_kb,
     feedback_applied_kb,
@@ -39,33 +41,64 @@ from services.deepseek_service import deepseek_service
 router = Router()
 logger = logging.getLogger(__name__)
 
-# ── Константы вопросов ──────────────────────────────────────
+# ── Константы вопросов чекина ───────────────────────────────
+# Формат: (короткое_название, полный_текст_вопроса, подвопрос)
 QUESTIONS = [
-    ("Энергия", "Как бы ты оценил свой уровень энергии сегодня?"),
-    ("Концентрация", "Насколько ты был сфокусирован и концентрирован?"),
-    ("Стресс", "Как бы ты оценил уровень стресса?"),
-    ("Приоритеты", "Насколько успешно ты следовал своим приоритетам?"),
-    ("Восстановление", "Как прошло восстановление (сон, отдых)?"),
+    (
+        "Энергия",
+        "Какой был уровень энергии в течение дня? Насколько хватало физических сил "
+        "на всё, что ты делал? Оцени не момент прямо сейчас, а общее ощущение "
+        "«заряженности» за день — от подъёма до вечера.\n"
+        "1 — еле дотянул, 10 — полный резервуар.",
+        "Что повлияло на уровень энергии за день?",
+    ),
+    (
+        "Ясность",
+        "Насколько ясным был ум в течение дня? Легко ли соображалось, принимались "
+        "решения, удерживалась мысль? Оцени качество работы головы за весь день.\n"
+        "1 — постоянный туман и путаница, 10 — кристальная ясность мышления.",
+        "Что повлияло на ясность мышления за день?",
+    ),
+    (
+        "Вовлечённость",
+        "Насколько ты был включён в происходящее в течение дня? Чувствовал ли себя "
+        "автором своих действий, или скорее тянулся по инерции? Было ли желание "
+        "влиять на события, брать на себя, действовать от себя?\n"
+        "1 — полное отсутствие воли, всё равно, 10 — максимально включён, управляю ситуацией.",
+        "Что повлияло на включённость и мотивацию за день?",
+    ),
+    (
+        "Напряжение",
+        "Какой была нагрузка на тебя в течение дня? Сколько давления — внешних "
+        "требований, дедлайнов, конфликтов, внутренней тревоги — ты нёс? Оцени "
+        "не стресс как эмоцию, а общий груз на плечах.\n"
+        "1 — никакой нагрузки, полная расслабленность, 10 — на пределе, всё давит.",
+        "Что повлияло на уровень напряжения за день?",
+    ),
+    (
+        "Восстановление",
+        "Насколько качественно ты восстановился за прошедшую ночь и день? "
+        "Почувствовал ли подзарядку от сна, были ли моменты отдыха, или с утра "
+        "уже не выспался? Оцени именно качество регенерации, а не количество часов.\n"
+        "1 — совершенно не восстановился, организм не перезагрузился, "
+        "10 — полностью регенерирован, чувствую себя обновлённым.",
+        "Что повлияло на качество восстановления?",
+    ),
 ]
+
+# ── Веса для Readiness Score ────────────────────────────────
+# q1=Энергия(0.25), q2=Ясность(0.20), q3=Вовлечённость(0.15),
+# q4=Напряжение(0.10 инвертированное), q5=Восстановление(0.30)
+READINESS_WEIGHTS = {
+    "q1": 0.25,  # Энергия
+    "q2": 0.20,  # Ясность
+    "q3": 0.15,  # Вовлечённость
+    "q4": 0.10,  # Напряжение (инвертируется)
+    "q5": 0.30,  # Восстановление
+}
 
 
 # ── Вспомогательные функции ─────────────────────────────────
-
-async def _get_repo(callback_or_msg: CallbackQuery | Message) -> Repo:
-    """Извлекает Repo из данных бота."""
-    bot_data = callback_or_msg.bot.get("repo")
-    if bot_data:
-        return bot_data
-    # Альтернативный путь через middleware data
-    return callback_or_msg.bot.get("repo")
-
-
-async def _get_user_id(msg: Message | CallbackQuery) -> int:
-    """Получает internal user_id по Telegram ID."""
-    repo: Repo = msg.bot.get("repo")  # type: ignore
-    user = await repo.get_user_by_tg(msg.from_user.id)  # type: ignore
-    return user["id"]
-
 
 async def _ensure_state_data(state: FSMContext) -> dict:
     """Возвращает данные FSM или пустой словарь."""
@@ -102,7 +135,6 @@ def _split_long_message(text: str, max_len: int = 4000) -> list[str]:
         if len(text) <= max_len:
             parts.append(text)
             break
-        # Ищем ближайший перенос строки для корректного разрыва
         cut = text.rfind("\n", 0, max_len)
         if cut == -1:
             cut = max_len
@@ -111,22 +143,99 @@ def _split_long_message(text: str, max_len: int = 4000) -> list[str]:
     return parts
 
 
+def _calc_readiness_score(diary_data: dict) -> float:
+    """
+    Вычисляет Readiness Score по формуле:
+    Readiness = Восстановление×0.30 + Энергия×0.25 + Ясность×0.20
+              + Вовлечённость×0.15 + (10−Напряжение)×0.10
+    """
+    score = 0.0
+    for q_key, weight in READINESS_WEIGHTS.items():
+        q_info = diary_data.get(q_key, {})
+        val = q_info.get("score", 5)
+        if q_key == "q4":
+            # Напряжение — инвертируем (чем больше, тем хуже)
+            val = 10 - val
+        score += val * weight
+    return round(score, 1)
+
+
+def _readiness_emoji(score: float) -> str:
+    """Возвращает эмодзи в зависимости от Readiness Score."""
+    if score >= 8:
+        return "🟢"
+    elif score >= 6:
+        return "🟡"
+    elif score >= 4:
+        return "🟠"
+    else:
+        return "🔴"
+
+
+def _detect_trend(recent_entries: list) -> str:
+    """
+    Определяет тренд Readiness Score по последним записям.
+    Возвращает: '📈 растёт', '📉 падает', '➡️ стабилен'.
+    """
+    if len(recent_entries) < 2:
+        return "➡️ недостаточно данных"
+
+    scores = []
+    for entry in recent_entries:
+        rs = entry.get("readiness_score")
+        if rs is not None:
+            scores.append(float(rs))
+        else:
+            # Вычисляем из data
+            d = entry.get("data", {})
+            if isinstance(d, str):
+                d = json.loads(d)
+            scores.append(_calc_readiness_score(d))
+
+    if len(scores) < 2:
+        return "➡️ недостаточно данных"
+
+    # Смотрим последние 3 значения (или меньше)
+    recent = scores[-3:]
+    if all(recent[i] < recent[i + 1] for i in range(len(recent) - 1)):
+        return "📈 растёт"
+    elif all(recent[i] > recent[i + 1] for i in range(len(recent) - 1)):
+        return "📉 падает"
+    else:
+        return "➡️ стабилен"
+
+
 def _build_diary_prompt(diary_data: dict, events_data: dict) -> str:
     """Формирует текстовый промпт для DeepSeek из данных пользователя."""
-    parts = ["История дневника продуктивности:\n"]
+    parts = ["История дневника продуктивности (5 измерений):\n"]
+
+    # Названия вопросов для расшифровки
+    q_names = {f"q{i+1}": QUESTIONS[i][0] for i in range(5)}
+
     for entry in diary_data.get("diary", []):
-        parts.append(f"  Дата: {entry['date']}")
+        rs = entry.get("readiness_score")
+        rs_text = f" | Readiness: {rs}" if rs else ""
+        parts.append(f"  Дата: {entry['date']}{rs_text}")
         d = entry.get("data", {})
         if isinstance(d, str):
             d = json.loads(d)
         for qk, qv in d.items():
-            parts.append(f"    {qk}: оценка={qv.get('score')}, коммент={qv.get('comment')}")
+            name = q_names.get(qk, qk)
+            parts.append(f"    {name}: оценка={qv.get('score')}, коммент={qv.get('comment')}")
         parts.append("")
 
     parts.append("\nПредстоящие события:\n")
+    type_labels = {
+        "presentation": "Выступление",
+        "physical": "Физ. нагрузка",
+        "strategic": "Стратег. решение",
+        "routine": "Рутина",
+        "negotiation": "Переговоры",
+    }
     for ev in events_data.get("events", []):
+        et = type_labels.get(ev.get("event_type", ""), ev.get("event_type", ""))
         parts.append(
-            f"  {ev['date']} {ev['time']} — {ev['name']} "
+            f"  {ev['date']} {ev['time']} — [{et}] {ev['name']} "
             f"(приоритет: {ev['priority']}): {ev['description']}"
         )
 
@@ -227,11 +336,11 @@ async def diary_process_date(message: Message, state: FSMContext):
 
 async def _start_checkin(message_or_callback: Message | CallbackQuery, state: FSMContext, question_index: int = 1):
     """Начинает или продолжает процесс 5 вопросов."""
-    q_name, q_text = QUESTIONS[question_index - 1]
+    q_name, q_text, _ = QUESTIONS[question_index - 1]
     await state.update_data(current_q=question_index)
     await state.set_state(Diary.waiting_score)
 
-    text = f"Вопрос {question_index} из 5 — {q_name}\n{q_text}\nОцените от 1 до 10:"
+    text = f"Вопрос {question_index} из 5 — {q_name}\n{q_text}\n\nОцените от 1 до 10:"
     kb = score_kb(prefix="diary_score")
 
     if isinstance(message_or_callback, CallbackQuery):
@@ -249,8 +358,11 @@ async def diary_score_selected(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(temp_score=score)
     await state.set_state(Diary.waiting_comment)
+
+    # Подвопрос зависит от категории
+    _, _, sub_question = QUESTIONS[current_q - 1]
     await callback.message.answer(
-        f"Вы поставили {score}. Что повлияло на эту оценку? (напишите комментарий)"
+        f"Вы поставили {score}. {sub_question}"
     )
     await callback.answer()
 
@@ -270,7 +382,10 @@ async def diary_comment_received(message: Message, state: FSMContext):
         # Переход к следующему вопросу
         await _start_checkin(message, state, question_index=current_q + 1)
     else:
-        # Все вопросы отвечены — сохраняем в БД
+        # Все вопросы отвечены — вычисляем Readiness Score
+        readiness = _calc_readiness_score(diary_data)
+        emoji = _readiness_emoji(readiness)
+
         selected_date_str: str = data.get("selected_date", str(date.today()))
         parsed_date = _parse_date(selected_date_str)
         user_id: int = data.get("user_id")
@@ -278,13 +393,37 @@ async def diary_comment_received(message: Message, state: FSMContext):
 
         existing = await repo.get_diary_entry(user_id, parsed_date)  # type: ignore
         if existing:
-            await repo.update_diary_entry(user_id, parsed_date, diary_data)  # type: ignore
+            await repo.update_diary_entry(user_id, parsed_date, diary_data, readiness)  # type: ignore
         else:
-            await repo.create_diary_entry(user_id, parsed_date, diary_data)  # type: ignore
+            await repo.create_diary_entry(user_id, parsed_date, diary_data, readiness)  # type: ignore
+
+        # Определяем тренд по последним записям
+        recent = await repo.get_recent_diary(user_id, days=7)
+        # Преобразуем записи для функции тренда
+        recent_for_trend = []
+        for r in recent:
+            d = r["data"] if isinstance(r["data"], dict) else json.loads(r["data"])
+            recent_for_trend.append({
+                "data": d,
+                "readiness_score": float(r["readiness_score"]) if r["readiness_score"] else None,
+            })
+        trend = _detect_trend(recent_for_trend)
 
         await state.clear()
+
+        # Формируем сводку
+        q_names = [QUESTIONS[i][0] for i in range(5)]
+        summary_lines = []
+        for i, name in enumerate(q_names, 1):
+            q = diary_data.get(f"q{i}", {})
+            summary_lines.append(f"  {name}: {q.get('score', '—')} — {q.get('comment', '')}")
+
         await message.answer(
-            "✅ Запись дня сохранена! Выберите следующее действие.",
+            f"✅ Запись дня сохранена!\n\n"
+            f"{emoji} Readiness Score: {readiness}/10\n"
+            f"Тренд: {trend}\n\n"
+            f"📊 Сводка за день:\n" +
+            "\n".join(summary_lines),
             reply_markup=main_menu_kb(),
         )
 
@@ -347,15 +486,20 @@ async def diary_edit_question(callback: CallbackQuery, state: FSMContext):
     q_num = int(parts[2])   # 1-5
 
     if action_type == "done":
-        # Сохраняем и выходим
+        # Сохраняем, пересчитываем Readiness и выходим
         data = await _ensure_state_data(state)
         diary_data: dict = data.get("diary_data", {})
         parsed_date = _parse_date(data.get("selected_date", ""))
         user_id: int = data.get("user_id")
+        readiness = _calc_readiness_score(diary_data)
         repo: Repo = callback.bot.get("repo")  # type: ignore
-        await repo.update_diary_entry(user_id, parsed_date, diary_data)  # type: ignore
+        await repo.update_diary_entry(user_id, parsed_date, diary_data, readiness)  # type: ignore
         await state.clear()
-        await callback.message.answer("✅ Изменения сохранены!", reply_markup=main_menu_kb())
+        emoji = _readiness_emoji(readiness)
+        await callback.message.answer(
+            f"✅ Изменения сохранены! {emoji} Readiness: {readiness}/10",
+            reply_markup=main_menu_kb(),
+        )
         await callback.answer()
         return
 
@@ -365,19 +509,20 @@ async def diary_edit_question(callback: CallbackQuery, state: FSMContext):
     diary_data = data.get("diary_data", {})
     q_key = f"q{q_num}"
     q_info = diary_data.get(q_key, {})
+    q_name = QUESTIONS[q_num - 1][0]
 
     if action_type == "score":
         await state.set_state(Diary.waiting_edit_score)
         old_score = q_info.get("score", "—")
         await callback.message.answer(
-            f"Вопрос {q_num}: текущая оценка = {old_score}\nВыберите новую оценку:",
+            f"{q_name}: текущая оценка = {old_score}\nВыберите новую оценку:",
             reply_markup=score_kb(prefix="edit_score"),
         )
     elif action_type == "comment":
         await state.set_state(Diary.waiting_edit_comment)
         old_comment = q_info.get("comment", "—")
         await callback.message.answer(
-            f"Вопрос {q_num}: текущий комментарий = «{old_comment}»\n"
+            f"{q_name}: текущий комментарий = «{old_comment}»\n"
             "Введите новый комментарий:"
         )
     await callback.answer()
@@ -391,13 +536,14 @@ async def diary_edit_score_save(callback: CallbackQuery, state: FSMContext):
     q_num: int = data.get("edit_q_num", 1)
     diary_data: dict = data.get("diary_data", {})
     q_key = f"q{q_num}"
+    q_name = QUESTIONS[q_num - 1][0]
 
     if q_key not in diary_data:
         diary_data[q_key] = {}
     diary_data[q_key]["score"] = new_score
     await state.update_data(diary_data=diary_data)
 
-    await callback.message.answer(f"Оценка вопроса {q_num} обновлена на {new_score}.")
+    await callback.message.answer(f"{q_name}: оценка обновлена на {new_score}.")
     # Возврат в меню редактирования
     await state.set_state(Diary.waiting_edit_question)
     await callback.message.answer(
@@ -413,13 +559,14 @@ async def diary_edit_comment_save(message: Message, state: FSMContext):
     q_num: int = data.get("edit_q_num", 1)
     diary_data: dict = data.get("diary_data", {})
     q_key = f"q{q_num}"
+    q_name = QUESTIONS[q_num - 1][0]
 
     if q_key not in diary_data:
         diary_data[q_key] = {}
     diary_data[q_key]["comment"] = message.text.strip()
     await state.update_data(diary_data=diary_data)
 
-    await message.answer(f"Комментарий вопроса {q_num} обновлён.")
+    await message.answer(f"{q_name}: комментарий обновлён.")
     # Возврат в меню редактирования
     await state.set_state(Diary.waiting_edit_question)
     await message.answer(
@@ -452,10 +599,15 @@ async def diary_add_question(callback: CallbackQuery, state: FSMContext):
         diary_data: dict = data.get("diary_data", {})
         parsed_date = _parse_date(data.get("selected_date", ""))
         user_id: int = data.get("user_id")
+        readiness = _calc_readiness_score(diary_data)
         repo: Repo = callback.bot.get("repo")  # type: ignore
-        await repo.update_diary_entry(user_id, parsed_date, diary_data)  # type: ignore
+        await repo.update_diary_entry(user_id, parsed_date, diary_data, readiness)  # type: ignore
         await state.clear()
-        await callback.message.answer("✅ Добавления сохранены!", reply_markup=main_menu_kb())
+        emoji = _readiness_emoji(readiness)
+        await callback.message.answer(
+            f"✅ Добавления сохранены! {emoji} Readiness: {readiness}/10",
+            reply_markup=main_menu_kb(),
+        )
         await callback.answer()
         return
 
@@ -465,19 +617,20 @@ async def diary_add_question(callback: CallbackQuery, state: FSMContext):
     diary_data = data.get("diary_data", {})
     q_key = f"q{q_num}"
     q_info = diary_data.get(q_key, {})
+    q_name = QUESTIONS[q_num - 1][0]
 
     if action_type == "score":
         await state.set_state(Diary.waiting_add_score)
         old_score = q_info.get("score", "—")
         await callback.message.answer(
-            f"Вопрос {q_num}: текущая оценка = {old_score}\nВыберите новую оценку:",
+            f"{q_name}: текущая оценка = {old_score}\nВыберите новую оценку:",
             reply_markup=score_kb(prefix="add_score"),
         )
     elif action_type == "comment":
         await state.set_state(Diary.waiting_add_comment)
         old_comment = q_info.get("comment", "—")
         await callback.message.answer(
-            f"Вопрос {q_num}: текущий комментарий = «{old_comment}»\n"
+            f"{q_name}: текущий комментарий = «{old_comment}»\n"
             "Введите новый комментарий (перезапишет существующий):"
         )
     await callback.answer()
@@ -491,13 +644,14 @@ async def diary_add_score_save(callback: CallbackQuery, state: FSMContext):
     q_num: int = data.get("add_q_num", 1)
     diary_data: dict = data.get("diary_data", {})
     q_key = f"q{q_num}"
+    q_name = QUESTIONS[q_num - 1][0]
 
     if q_key not in diary_data:
         diary_data[q_key] = {}
     diary_data[q_key]["score"] = new_score
     await state.update_data(diary_data=diary_data)
 
-    await callback.message.answer(f"Оценка вопроса {q_num} обновлена на {new_score}.")
+    await callback.message.answer(f"{q_name}: оценка обновлена на {new_score}.")
     await state.set_state(Diary.waiting_add_question)
     await callback.message.answer(
         "Продолжите добавление или нажмите «Готово»:",
@@ -512,13 +666,14 @@ async def diary_add_comment_save(message: Message, state: FSMContext):
     q_num: int = data.get("add_q_num", 1)
     diary_data: dict = data.get("diary_data", {})
     q_key = f"q{q_num}"
+    q_name = QUESTIONS[q_num - 1][0]
 
     if q_key not in diary_data:
         diary_data[q_key] = {}
     diary_data[q_key]["comment"] = message.text.strip()
     await state.update_data(diary_data=diary_data)
 
-    await message.answer(f"Комментарий вопроса {q_num} обновлён.")
+    await message.answer(f"{q_name}: комментарий обновлён.")
     await state.set_state(Diary.waiting_add_question)
     await message.answer(
         "Продолжите добавление или нажмите «Готово»:",
@@ -576,6 +731,7 @@ async def planner_process_date(message: Message, state: FSMContext):
                 "id": e["id"],
                 "time": str(e["time"]),
                 "name": e["name"],
+                "event_type": e.get("event_type", "routine"),
             }
             for e in events
         ]
@@ -608,8 +764,23 @@ async def planner_add_name(message: Message, state: FSMContext):
 @router.message(Planner.waiting_description)
 async def planner_add_description(message: Message, state: FSMContext):
     await state.update_data(event_description=message.text.strip())
+    await state.set_state(Planner.waiting_event_type)
+    await message.answer(
+        "🏷 Выберите тип события:",
+        reply_markup=event_type_kb(),
+    )
+
+
+@router.callback_query(Planner.waiting_event_type, F.data.startswith("etype:"))
+async def planner_add_event_type(callback: CallbackQuery, state: FSMContext):
+    event_type = callback.data.split(":")[1]
+    await state.update_data(event_type_val=event_type)
     await state.set_state(Planner.waiting_priority)
-    await message.answer("⚡ Введите приоритет (1-10):", reply_markup=score_kb(prefix="plan_pri"))
+    await callback.message.answer(
+        "⚡ Выберите приоритет (1-10):",
+        reply_markup=score_kb(prefix="plan_pri"),
+    )
+    await callback.answer()
 
 
 @router.callback_query(Planner.waiting_priority, F.data.startswith("plan_pri:"))
@@ -622,6 +793,7 @@ async def planner_add_priority(callback: CallbackQuery, state: FSMContext):
     user = await repo.get_user_by_tg(callback.from_user.id)
     parsed_date = _parse_date(data.get("selected_date", ""))
     parsed_time = _parse_time(data.get("event_time", "12:00"))
+    event_type = data.get("event_type_val", "routine")
 
     await repo.create_event(
         user_id=user["id"],
@@ -630,10 +802,15 @@ async def planner_add_priority(callback: CallbackQuery, state: FSMContext):
         name=data.get("event_name", ""),
         description=data.get("event_description", ""),
         priority=priority,
+        event_type=event_type,
     )
 
+    type_label = EVENT_TYPES.get(event_type, event_type)
     await state.clear()
-    await callback.message.answer("✅ Событие создано!", reply_markup=main_menu_kb())
+    await callback.message.answer(
+        f"✅ Событие создано!\nТип: {type_label}",
+        reply_markup=main_menu_kb(),
+    )
     await callback.answer()
 
 
@@ -697,21 +874,25 @@ async def planner_edit_field(callback: CallbackQuery, state: FSMContext):
     field = callback.data.split(":")[1]
     await state.update_data(edit_field=field)
 
-    hints = {
-        "event_date": "Введите новую дату (ДД.ММ.ГГГГ):",
-        "time": "Введите новое время (ЧЧ:ММ):",
-        "name": "Введите новое название:",
-        "description": "Введите новое описание:",
-        "priority": "Введите новый приоритет (1-10):",
-    }
-
     if field == "priority":
         await state.set_state(Planner.waiting_edit_value)
         await callback.message.answer(
-            hints.get(field, "Введите новое значение:"),
+            "Выберите новый приоритет (1-10):",
             reply_markup=score_kb(prefix="edit_pri"),
         )
+    elif field == "event_type":
+        await state.set_state(Planner.waiting_edit_value)
+        await callback.message.answer(
+            "Выберите новый тип события:",
+            reply_markup=event_type_kb(),
+        )
     else:
+        hints = {
+            "event_date": "Введите новую дату (ДД.ММ.ГГГГ):",
+            "time": "Введите новое время (ЧЧ:ММ):",
+            "name": "Введите новое название:",
+            "description": "Введите новое описание:",
+        }
         await state.set_state(Planner.waiting_edit_value)
         await callback.message.answer(hints.get(field, "Введите новое значение:"))
     await callback.answer()
@@ -727,6 +908,22 @@ async def planner_edit_priority_save(callback: CallbackQuery, state: FSMContext)
     await repo.update_event_field(event_id, "priority", priority)
     await state.clear()
     await callback.message.answer("✅ Приоритет обновлён!", reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(Planner.waiting_edit_value, F.data.startswith("etype:"))
+async def planner_edit_event_type_save(callback: CallbackQuery, state: FSMContext):
+    event_type = callback.data.split(":")[1]
+    data = await _ensure_state_data(state)
+    event_id: int = data.get("edit_event_id", 0)
+    repo: Repo = callback.bot.get("repo")  # type: ignore
+    await repo.update_event_field(event_id, "event_type", event_type)
+    type_label = EVENT_TYPES.get(event_type, event_type)
+    await state.clear()
+    await callback.message.answer(
+        f"✅ Тип события обновлён на: {type_label}",
+        reply_markup=main_menu_kb(),
+    )
     await callback.answer()
 
 
@@ -792,7 +989,19 @@ async def cycles_calculate(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    # Добавляем тренд в промпт
+    recent = await repo.get_recent_diary(user["id"], days=7)
+    recent_for_trend = []
+    for r in recent:
+        d = r["data"] if isinstance(r["data"], dict) else json.loads(r["data"])
+        recent_for_trend.append({
+            "data": d,
+            "readiness_score": float(r["readiness_score"]) if r["readiness_score"] else None,
+        })
+    trend = _detect_trend(recent_for_trend)
+
     prompt = _build_diary_prompt(history, history)
+    prompt += f"\n\nТекущий тренд Readiness: {trend}"
 
     try:
         report = await deepseek_service.predict(prompt)

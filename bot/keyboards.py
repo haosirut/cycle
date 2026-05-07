@@ -52,19 +52,30 @@ def existing_entry_kb() -> InlineKeyboardMarkup:
 
 
 # ── Клавиатура редактирования вопросов (1-5 / О-О...) ───────
+# Названия категорий для подписей на кнопках
+QUESTION_LABELS = {
+    1: "Энерг",
+    2: "Ясн",
+    3: "Вовл",
+    4: "Напр",
+    5: "Восст",
+}
+
+
 def edit_questions_kb(data: dict, prefix: str = "editq") -> InlineKeyboardMarkup:
     """
     Клавиатура для изменения оценок и комментариев к 5 вопросам.
-    Верхний ряд — цифры (изменить оценку), нижний — «О» (изменить комментарий).
+    Верхний ряд — категории с оценками, нижний — «О» (изменить комментарий).
     """
     row_nums = []
     row_comments = []
     for i in range(1, 6):
         q = data.get(f"q{i}", {})
         score_val = q.get("score", "—")
+        label = QUESTION_LABELS.get(i, str(i))
         row_nums.append(
             InlineKeyboardButton(
-                text=f"[{i}] {score_val}",
+                text=f"{label} {score_val}",
                 callback_data=f"{prefix}:score:{i}",
             )
         )
@@ -86,9 +97,10 @@ def add_questions_kb(data: dict, prefix: str = "addq") -> InlineKeyboardMarkup:
     for i in range(1, 6):
         q = data.get(f"q{i}", {})
         score_val = q.get("score", "—")
+        label = QUESTION_LABELS.get(i, str(i))
         row_nums.append(
             InlineKeyboardButton(
-                text=f"[{i}] {score_val}",
+                text=f"{label} {score_val}",
                 callback_data=f"{prefix}:score:{i}",
             )
         )
@@ -100,6 +112,30 @@ def add_questions_kb(data: dict, prefix: str = "addq") -> InlineKeyboardMarkup:
         )
     back_row = [InlineKeyboardButton(text="🔙 Готово", callback_data=f"{prefix}:done")]
     return InlineKeyboardMarkup(inline_keyboard=[row_nums, row_comments, back_row])
+
+
+# ── Тип события ─────────────────────────────────────────────
+EVENT_TYPES = {
+    "presentation": "🎤 Выступление",
+    "physical": "💪 Физ. нагрузка",
+    "strategic": "🧠 Стратег. решение",
+    "routine": "📋 Рутина",
+    "negotiation": "🤝 Переговоры",
+}
+
+
+def event_type_kb() -> InlineKeyboardMarkup:
+    """Выбор типа события при создании."""
+    kb = []
+    row = []
+    for code, label in EVENT_TYPES.items():
+        row.append(InlineKeyboardButton(text=label, callback_data=f"etype:{code}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 # ── Планировщик: выбор действия ─────────────────────────────
@@ -132,10 +168,12 @@ def events_list_kb(
 
     rows = []
     for idx, ev in enumerate(page_events, start=1):
+        type_label = EVENT_TYPES.get(ev.get("event_type", ""), "")
+        type_tag = f" {type_label}" if type_label else ""
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{idx}. [{ev['time'][:5]}] {ev['name']}",
+                    text=f"{idx}. [{ev['time'][:5]}] {ev['name']}{type_tag}",
                     callback_data=f"{prefix}:pick:{ev['id']}",
                 )
             ]
@@ -169,7 +207,10 @@ def event_edit_field_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Название", callback_data="efield:name"),
             InlineKeyboardButton(text="Описание", callback_data="efield:description"),
         ],
-        [InlineKeyboardButton(text="Приоритет", callback_data="efield:priority")],
+        [
+            InlineKeyboardButton(text="Приоритет", callback_data="efield:priority"),
+            InlineKeyboardButton(text="Тип", callback_data="efield:event_type"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 

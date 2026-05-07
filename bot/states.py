@@ -56,10 +56,11 @@ class Planner(StatesGroup):
     # Выбор даты
     waiting_date = State()
 
-    # Добавление события — 4 шага
+    # Добавление события — шаги
     waiting_time = State()
     waiting_name = State()
     waiting_description = State()
+    waiting_event_type = State()
     waiting_priority = State()
 
     # Выбор события из списка (изменить / удалить)
